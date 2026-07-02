@@ -1,23 +1,30 @@
 <script setup>
-import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import QRCamera from '@/components/Utilities/QRCamera.vue'
 import StandardButton from '@/components/Common/StandardButton.vue'
+import KioskLauncherInstructions from '@/components/Common/KioskLauncherInstructions.vue'
 import { useCameraStore } from '@/stores/camera'
 import { useEventyayApi } from '@/stores/eventyayapi'
 import { useLoadingStore } from '@/stores/loading'
-import { getEventyayLogoProps, getRoleRouteName, STATION_TYPE_DEFINITIONS } from '@/utils/session'
+import { getEventyayLogoProps, getRoleLabel, getRoleRouteName, STATION_TYPE_DEFINITIONS } from '@/utils/session'
+import { isRoleAllowedForProfile, getAllowedRolesForProfile } from '@/utils/deviceProfiles'
+import { buildKioskUrl, isKioskEnvironment } from '@/utils/kioskLauncher'
 import { UserGroupIcon, PrinterIcon, BuildingStorefrontIcon } from '@heroicons/vue/24/outline'
 
 const loadingStore = useLoadingStore()
 const processApi = useEventyayApi()
 const cameraStore = useCameraStore()
 const router = useRouter()
+const route = useRoute()
 
 const errmessage = ref('')
 const showError = ref(false)
 const showScanner = ref(false)
+const showKioskPrereq = ref(false)
 const pendingRole = ref('')
+const isKioskShell = computed(() => isKioskEnvironment(route))
+const kioskLoginUrl = computed(() => buildKioskUrl(window.location.origin, '/'))
 
 const ROLE_ICONS = {
   CheckIn: UserGroupIcon,
@@ -25,10 +32,35 @@ const ROLE_ICONS = {
   Exhibitor: BuildingStorefrontIcon
 }
 
-const roles = STATION_TYPE_DEFINITIONS.map((station) => ({
-  ...station,
-  icon: ROLE_ICONS[station.id]
-}))
+const roles = computed(() => {
+  const allRoles = STATION_TYPE_DEFINITIONS.map((station) => ({
+    ...station,
+    icon: ROLE_ICONS[station.id]
+  }))
+
+  if (!processApi.apitoken) {
+    return allRoles
+  }
+
+  const allowedRoles = getAllowedRolesForProfile(processApi.securityProfile)
+  if (!allowedRoles) {
+    return allRoles
+  }
+
+  return allRoles.filter((station) => allowedRoles.includes(station.id))
+})
+
+const pendingStationLabel = computed(() => {
+  if (!pendingRole.value) {
+    return ''
+  }
+  const station = STATION_TYPE_DEFINITIONS.find((item) => item.id === pendingRole.value)
+  return station?.title || getRoleLabel(pendingRole.value)
+})
+
+const isRegisteringDevice = computed(
+  () => showScanner.value || showKioskPrereq.value
+)
 
 function redirectForRole(role) {
   const routeName = getRoleRouteName(role)
@@ -43,17 +75,59 @@ function redirectForRole(role) {
   }
 }
 
+// Only checked right after a fresh device registration, so an already-registered device's
+// picked mode never gets second-guessed later — the security profile is for access clearance,
+// it should not change how an established session behaves.
+function redirectAfterRegistration(role) {
+  if (!isRoleAllowedForProfile(role, processApi.securityProfile)) {
+    router.push({ name: 'profileMismatch' })
+    return
+  }
+  redirectForRole(role)
+}
+
 function handleRoleSelection(role) {
   pendingRole.value = role
-  processApi.setRole(role)
   showError.value = false
+  showKioskPrereq.value = false
 
   if (!processApi.apitoken) {
+    processApi.setRole(role)
+    if (role === 'Badge Station' && !isKioskShell.value) {
+      showKioskPrereq.value = true
+      return
+    }
     showScanner.value = true
     return
   }
 
+  if (!isRoleAllowedForProfile(role, processApi.securityProfile)) {
+    processApi.setRole(role)
+    router.push({ name: 'profileMismatch' })
+    return
+  }
+
+  processApi.applyStationTypeChange(role)
+  processApi.setRole(role)
   redirectForRole(role)
+}
+
+function proceedToDeviceRegistration() {
+  showKioskPrereq.value = false
+  showScanner.value = true
+}
+
+function backToStationSelection() {
+  showScanner.value = false
+  showKioskPrereq.value = false
+  showManualInput.value = false
+  pendingRole.value = ''
+  showError.value = false
+  errmessage.value = ''
+  cameraStore.clearLastScan()
+  if (!processApi.apitoken) {
+    processApi.setRole('')
+  }
 }
 
 async function handleQrScanned() {
@@ -64,7 +138,7 @@ async function handleQrScanned() {
     const result = await processApi.registerDeviceByQr(cameraStore.qrCodeValue)
     if (result.success) {
       showScanner.value = false
-      redirectForRole(pendingRole.value || processApi.selectedRole)
+      redirectAfterRegistration(pendingRole.value || processApi.selectedRole)
     } else if (result.error === 'unsupported_handshake') {
       errmessage.value = 'This QR code requires a newer version of the check-in app.'
       showError.value = true
@@ -108,7 +182,7 @@ async function handleManualRegister() {
     if (result.success) {
       showScanner.value = false
       showManualInput.value = false
-      redirectForRole(pendingRole.value || processApi.selectedRole)
+      redirectAfterRegistration(pendingRole.value || processApi.selectedRole)
     } else if (result.error === 'invalid_url') {
       errmessage.value = 'Invalid Server URL. Please enter a valid URL.'
       showError.value = true
@@ -128,6 +202,12 @@ async function handleManualRegister() {
   }
 }
 
+onMounted(() => {
+  if (processApi.apitoken) {
+    void processApi.syncDeviceInfo()
+  }
+})
+
 loadingStore.contentLoaded()
 </script>
 
@@ -137,11 +217,76 @@ loadingStore.contentLoaded()
       <div class="mb-8 text-center">
         <img v-bind="getEventyayLogoProps('full', 'mx-auto mb-4 h-10 w-auto max-w-[220px]')" />
         <h1>Check-in</h1>
-        <p class="mt-2 text-sm text-body-muted">Choose a station type to get started.</p>
+        <p class="mt-2 text-sm text-body-muted">
+          {{
+            isRegisteringDevice
+              ? `Register this device as ${pendingStationLabel}.`
+              : 'Choose a station type to get started.'
+          }}
+        </p>
       </div>
 
       <Transition name="fade" mode="out-in">
-        <div v-if="showScanner" key="scanner" class="space-y-4">
+        <div v-if="showKioskPrereq" key="kiosk-prereq" class="space-y-4">
+          <div
+            v-if="pendingStationLabel"
+            class="flex items-center justify-between gap-3 rounded-lg border border-primary/20 bg-primary/5 px-3 py-2"
+          >
+            <p class="min-w-0 text-sm text-body">
+              <span class="text-body-muted">Station type</span>
+              <span class="mx-1.5 text-body-muted">·</span>
+              <span class="font-semibold">{{ pendingStationLabel }}</span>
+            </p>
+            <button
+              type="button"
+              class="shrink-0 text-xs font-semibold text-primary hover:underline focus:outline-none"
+              @click="backToStationSelection"
+            >
+              Change
+            </button>
+          </div>
+
+          <div class="rounded-xl border border-surface-border bg-surface-muted p-4 text-center">
+            <p class="text-sm font-medium text-body">Set up kiosk mode before registering</p>
+            <p class="mt-1 text-xs text-body-muted">
+              Kiosk mode enables silent badge printing. Run the command below, then register in that
+              window.
+            </p>
+          </div>
+
+          <KioskLauncherInstructions
+            :target-url="kioskLoginUrl"
+            :show-registration-steps="true"
+          />
+
+          <StandardButton
+            type="button"
+            text="I'm in kiosk mode — register device"
+            variant="primary"
+            block
+            @click="proceedToDeviceRegistration"
+          />
+        </div>
+
+        <div v-else-if="showScanner" key="scanner" class="space-y-4">
+          <div
+            v-if="pendingStationLabel"
+            class="flex items-center justify-between gap-3 rounded-lg border border-primary/20 bg-primary/5 px-3 py-2"
+          >
+            <p class="min-w-0 text-sm text-body">
+              <span class="text-body-muted">Station type</span>
+              <span class="mx-1.5 text-body-muted">·</span>
+              <span class="font-semibold">{{ pendingStationLabel }}</span>
+            </p>
+            <button
+              type="button"
+              class="shrink-0 text-xs font-semibold text-primary hover:underline focus:outline-none"
+              @click="backToStationSelection"
+            >
+              Change
+            </button>
+          </div>
+
           <div v-if="!showManualInput" class="space-y-4">
             <div class="rounded-xl border border-surface-border bg-surface-muted p-4 text-center">
               <p class="text-sm font-medium text-body">Scan device registration QR</p>
@@ -159,13 +304,6 @@ loadingStore.contentLoaded()
                 Or enter URL and Token manually
               </button>
             </div>
-            <StandardButton
-              type="button"
-              text="Back"
-              variant="white"
-              block
-              @click="showScanner = false"
-            />
           </div>
 
           <div v-else class="space-y-4">
